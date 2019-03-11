@@ -27,11 +27,11 @@ with recursive
   work_ballots(
       candidate,    -- candidate at the front of the prefs list
       remainder,    -- remainder of the prefs list, if any
-          priority,     -- elimination priority of this candidate
-          vote_value,   -- value of this ballot for this candidate
-          vacancies,    -- number of remaining vacancies
-          final_result, -- "final" result flag
-          round         -- which round this is
+      priority, -- elimination priority of this candidate
+      vote_value,   -- value of this ballot for this candidate
+      vacancies,    -- number of remaining vacancies
+      final_result, -- "final" result flag
+      round     -- which round this is
   ) as (select prefs[1],
                prefs[2:],
                count(*) over (partition by prefs[1]),
@@ -42,38 +42,38 @@ with recursive
           from ballots
          where prefs[1] is not null
          union all
-                -- recursive term starts here.
+        -- recursive term starts here.
         (with
-               -- we can only access the recursive term once, so suck it
-               -- into a CTE.
+           -- we can only access the recursive term once, so suck it
+           -- into a CTE.
            w as (select * from work_ballots
-                              where not final_result
-                                and vacancies > 0),
-                   -- compute current totals by candidate; also note priority
-                   -- and round for later use (the min() is redundant, the
-                   -- priority and round is the same between all votes for a
-                   -- single candidate). Get the quota here as well for later
-                   -- computations to use.
+                  where not final_result
+                    and vacancies > 0),
+           -- compute current totals by candidate; also note priority
+           -- and round for later use (the min() is redundant, the
+           -- priority and round is the same between all votes for a
+           -- single candidate). Get the quota here as well for later
+           -- computations to use.
            c_score
-                     as (select w.candidate,
-                                min(w.priority) as priority,
-                                                min(w.round) as round,
-                                            sum(w.vote_value) as votes,
-                                                (select quota from cdata) as quota
-                               from w
-                              group by candidate),
+             as (select w.candidate,
+                        min(w.priority) as priority,
+                        min(w.round) as round,
+                        sum(w.vote_value) as votes,
+                        (select quota from cdata) as quota
+                   from w
+                  group by candidate),
            -- first elect at most one of the candidates over quota.
            -- if more than one is, we must elect the one with the
            -- largest surplus (= most votes), or the highest priority,
            -- or the highest precast lot for this round.
            elect
-                     as (select cs.candidate,
+             as (select cs.candidate,
                         cs.quota,
                         (cs.votes - cs.quota)/cs.votes as transfer_value,
                         cs.round
                    from c_score cs
                    join candidates c on (cs.candidate=c.candidate_id)
-                                  where cs.votes >= cs.quota
+                  where cs.votes >= cs.quota
                   order by cs.votes desc, cs.priority desc, c.precast_lots[round] desc
                   limit 1),
            -- if nobody was elected this round, we must exclude
@@ -82,62 +82,62 @@ with recursive
            -- priority, and in case of a tie of that, the lowest
            -- precast lot for this round.
            exclude
-                     as (select cs.candidate,
-                                    cs.quota,
-                                cs.round
+             as (select cs.candidate,
+                        cs.quota,
+                        cs.round
                    from c_score cs
                    join candidates c on (cs.candidate = c.candidate_id)
-                                  where not exists (select 1 from elect)
+                  where not exists (select 1 from elect)
                   order by cs.votes, cs.priority, c.precast_lots[round]
                   limit 1),
            -- this is the candidate we're retiring from the election in
-                   -- this round, whether by election or elimination.
+           -- this round, whether by election or elimination.
            retire(
-                       candidate,
-                           transfer_value,
-                           quota,
-                           round,
-                           nelect
-                   ) as (select candidate, transfer_value, quota, round, 1
-                               from elect
+               candidate,
+               transfer_value,
+               quota,
+               round,
+               nelect
+           ) as (select candidate, transfer_value, quota, round, 1
+                   from elect
                   union all
                  select candidate, 1.0, 0, round, 0
-                               from exclude),
+                   from exclude),
            -- for the candidate elected or excluded, we generate a new
            -- set of rows for their transferred ballots. The transfer
            -- value is determined by the elected/excluded candidate,
            -- but the priority must be updated to match the new first
            -- preference.
            transfer
-                     as (select w.remainder[1] as candidate,
+             as (select w.remainder[1] as candidate,
                         w.remainder[2:] as remainder,
                         trunc(w.vote_value * retire.transfer_value,5)
-                                                  as vote_value,
+                          as vote_value,
                         w.vacancies,
                         w.round
                    from w
                    join retire on (retire.candidate=w.candidate)
-                                  where w.remainder[1] is not null),
+                  where w.remainder[1] is not null),
            -- collect all existing ballots that will proceed to next
            -- round; we must remove the retiring candidate from the
            -- preference lists
            keep
-                     as (select w.candidate,
+             as (select w.candidate,
                         array_remove(w.remainder,
-                                                     (select candidate from retire))
-                                              as remainder,
+                                     (select candidate from retire))
+                          as remainder,
                         w.vote_value,
                         w.vacancies,
                         w.round
                    from w
                   where w.candidate <> (select candidate from retire)),
            -- prepare the new ballot list for next time, and append the
-                   -- result row for the retiring candidate
+           -- result row for the retiring candidate
            new_ballots
-                     as (select s.candidate,
+             as (select s.candidate,
                         s.remainder,
                         dense_rank() over (order by cs.votes, cs.priority)
-                                                  as priority,
+                          as priority,
                         s.vote_value,
                         s.vacancies - (select nelect from retire) as vacancies,
                         false as final_result,
@@ -146,18 +146,19 @@ with recursive
                           union all
                          select * from keep) s
                    join c_score cs on (s.candidate=cs.candidate)
-                                  where s.vote_value > 0
-                                  union all
+                  where s.vote_value > 0
+                  union all
                  select candidate,
-                                        null,
-                                                null,
-                                                quota,  -- 0 for excluded, quota for elected
-                                                null,
-                                                true,
-                                                round
-                                   from retire)
-               -- return output to next pass
-           select * from new_ballots))
+                        null,
+                        null,
+                        quota,  -- 0 for excluded, quota for elected
+                        null,
+                        true,
+                        round
+                   from retire)
+           -- return output to next pass
+           select * from new_ballots)
+)
 -- final output:
 select candidate,
        candidate_name,
