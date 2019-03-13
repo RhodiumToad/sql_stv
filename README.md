@@ -4,7 +4,7 @@ Single Transferable Vote as a single SQL query.
 
 This query attempts to implement STV using the algorithm specified in
 the
-[http://www.legislation.gov.uk/ssi/2007/42/schedule/1/part/III/crossheading/counting-of-votes/made](Scottish Local Government Elections Order 2007),
+[Scottish Local Government Elections Order 2007](http://www.legislation.gov.uk/ssi/2007/42/schedule/1/part/III/crossheading/counting-of-votes/made),
 but it has not been validated by anyone or even tested all that much;
 there are probably bugs.
 
