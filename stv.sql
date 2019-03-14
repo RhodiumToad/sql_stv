@@ -184,7 +184,7 @@ with recursive
 								(select quota from cdata) as quota,
 								max(w.vacancies) as vacancies,
 								bool_or(pending_xfer) as pending_xfer,
-								count(*) over () as num_candidates
+								sum(every(not pending_xfer)::integer) over () as num_candidates
 						   from w
 						  group by candidate) s
 				  where s.num_candidates > s.vacancies),
@@ -256,7 +256,8 @@ with recursive
 						1
 				   from w
 				  where not exists (select 1 from c_score)
-				  group by w.candidate),
+				  group by w.candidate
+				 having every(w.pending_xfer is false)),
 		   -- for the candidate chosen for transfer, we generate a new
 		   -- set of rows for their transferred ballots. The transfer
 		   -- value is determined by the elected/excluded candidate,
@@ -286,7 +287,10 @@ with recursive
 		   -- collect all existing ballots that will proceed to next
 		   -- round; we must remove the retiring candidates from the
 		   -- preference lists. Be sure to preserve order when
-		   -- removing candidates.
+		   -- removing candidates. The complication is that we keep
+		   -- ballots from retiring candidates if, and only if, they
+		   -- have surpluses that are not being transferred this
+		   -- round.
 		   keep
 			 as (select w.candidate,
 			            array(select c_id
@@ -300,8 +304,10 @@ with recursive
 						s.candidate is not null as pending_xfer
 				   from w
 				   left join surpluses s on (s.candidate=w.candidate)
-				  where s.do_transfer is not true),
-		   -- compile annotations
+				  where s.do_transfer is not true
+				    and (s.do_transfer is false
+					     or w.candidate not in (select candidate from retire))),
+				  -- compile annotations
 		   annotation(round,json)
 		     as (select r.round,
 			            to_jsonb(a)
