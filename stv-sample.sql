@@ -7,7 +7,8 @@ insert into elections
        	      (2, 'Wombles', 2),
 	 		  (3, 'Testcase - no votes at all', 3),
       	      (4, 'Testcase - exhaustion', 4),
-              (5, 'Testcase - no first prefs', 2);
+              (5, 'Testcase - no first prefs', 2),
+			  (6, 'An actual election', 3);
 
 insert into candidates(election_id, candidate_id, candidate_name)
 select 1, ord, n
@@ -39,6 +40,11 @@ select 5, ord, n
   from unnest(array['Apples', 'Pears', 'Bananas', 'Oranges', 'Lemons'])
          with ordinality as u(n,ord);
 
+insert into candidates(election_id, candidate_id, candidate_name)
+select 6, ord, n
+  from unnest(array['A', 'B', 'C', 'D'])
+         with ordinality as u(n,ord);
+
 -- precast lots for each election
 -- one has to be careful with the array() call here, if it's not forced
 -- to be correlated to the outer table, it'll be computed only once and
@@ -58,6 +64,7 @@ execute cast_lots(2);
 execute cast_lots(3);
 execute cast_lots(4);
 execute cast_lots(5);
+execute cast_lots(6);
 
 -- insert_votes(election_id, '[[...],[...],[...],...]')
 prepare insert_votes(integer, json) as
@@ -722,4 +729,60 @@ execute insert_votes(5, '[
   [null,null,null,1,2],
   [null,1,null,null,2],
   [null,null,1,null,2]
+]');
+
+-- this has the data in a different format for ease of input
+prepare insert_votes2(integer, json) as
+insert into ballot_preferences(voter_id,
+                               election_id,
+							   candidate_id,
+							   preference)
+select voter_ord,
+       $1,
+	   candidate_ord::integer,
+	   pref::integer
+  from json_array_elements($2) with ordinality as a1(prefs, voter_ord),
+       json_array_elements_text(prefs) with ordinality as a2(candidate_ord, pref);
+
+execute insert_votes2(6, '[
+ [2,3,1,4],
+ [2,4,3,1],
+ [4,3,1],
+ [2,4,1,3],
+ [1,4,3,2],
+ [2,4],
+ [3,4,1],
+ [3,4,2,1],
+ [1,2,4],
+ [2,3,1,4],
+ [4,2,3],
+ [4,2,1,3],
+ [3,1,4],
+ [4,1,2,3],
+ [2,4,3,1],
+ [4,2,1],
+ [4,2,1,3],
+ [4,2,1,3],
+ [2,1,3,4],
+ [2,3,1],
+ [3,4,2,1],
+ [4,2,1,3],
+ [2,3,4,1],
+ [4,2,3,1],
+ [2,1,4,3],
+ [1],
+ [2,1,3,4],
+ [4,1,2,3],
+ [2,1,3,4],
+ [2,1,3],
+ [4,2,1,3],
+ [2,1,4,3],
+ [4,3,2,1],
+ [3,2,4],
+ [2,4,3,1],
+ [2,4,3,1],
+ [1,3,2,4],
+ [2,3,4,1],
+ [4,2,1],
+ [4,3,2,1]
 ]');
