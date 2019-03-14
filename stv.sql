@@ -1,17 +1,86 @@
 --
 
+prepare election_results(integer) as
 with recursive
+  -- parameters
+  params(election_id) as (values ($1)),
+  -- candidates in this election
+  cur_candidates
+    as (select *
+	      from candidates
+		 where election_id = (select election_id from params)),
+  --
+  -- This takes the raw ballot prefs and presents them in the original
+  -- format (array of candidate ids in preference order). The
+  -- following considerations apply:
+  --
+  -- 1. ("undervoting") It's explicitly legal for a ballot to omit
+  -- candidates (we allow either null preference or missing row to
+  -- stand for this). The list of preferences reflects only the
+  -- candidates marked, and the ballot will be discarded if it gets to
+  -- the end of its preference list. A ballot with no valid
+  -- preferences at all must be discarded (since it must not affect
+  -- the quota).
+  --
+  -- 2. ("overvoting") If a preference value appears more than once,
+  -- then this is considered an overvote and invalidates the
+  -- preference and all numerically higher preference values, but if
+  -- any lower (more preferred) preferences exist they are still
+  -- honoured. Again, if the first preference is invalid, then we have
+  -- to discard the ballot outright.
+  --
+  -- 3. Otherwise, only the relative numeric ranking of preferences
+  -- matters, the actual values do not.
+  --
+  -- Implementation: we detect duplicate prefs by using a count(*)
+  -- over the peers of each row; if it's not 1 then it's invalid,
+  -- and we use an every() (aka bool_and()) aggregate to propagate
+  -- the invalidity to all lower (less-preferred) preferences.
+  --
+  cooked_ballots
+    as (select election_id,
+	   		   voter_id,
+	   		   array_agg(candidate_id order by preference)
+	     	     filter (where valid_pref)
+		 		 as prefs
+  		  from (select election_id,
+               		   voter_id,
+			   		   candidate_id,
+			   		   preference,
+			   		   every(valid_pref)
+			     	     over (partition by election_id, voter_id
+				           	  	   order by preference asc
+					       	   	   range between unbounded preceding
+						                     and current row)
+				 		 as valid_pref
+		  		  from (select election_id,
+		                	   voter_id,
+					   		   candidate_id,
+					   		   preference,
+					   		   1 = count(*) over (partition by election_id, voter_id
+				           				 	  	 	  order by preference asc
+					                          		  range current row)
+					             as valid_pref
+				  		  from ballot_preferences
+				  		 where election_id = (select election_id from params)
+						   and preference is not null) s1
+	           ) s2
+		 group by election_id, voter_id
+        having bool_or(valid_pref)),
   -- common data about the whole election:
   --  vacancies = how many candidates to elect
   --  num_ballots = total valid ballots cast
   --  quota = the quota for election
+  -- the use of integer division for the quota calculation is intentional
   cdata
 	as (select vacancies,
 			   num_ballots,
 			   (num_ballots / (vacancies + 1)) + 1 as quota
-		  from (select 4 /*PARAMETER*/ as vacancies,
-					   count(*) as num_ballots
-				  from ballots) s),
+		  from (select (select count(*) from cooked_ballots) as num_ballots,
+		               e.num_vacancies as vacancies
+				  from elections e
+				 where e.election_id = (select election_id from params)
+				offset 0) s),
   -- "work_ballots" at each stage of the recursion is the working list
   -- of ballots. Initially, all ballots have "final_result" = false;
   -- when a candidate is elected or eliminated, we issue them a dummy
@@ -40,11 +109,11 @@ with recursive
   work_ballots(
 	  candidate,	-- candidate at the front of the prefs list
 	  remainder,	-- remainder of the prefs list, if any
-	  priority, -- elimination priority of this candidate
+	  priority,		-- elimination priority of this candidate
 	  vote_value,	-- value of this ballot for this candidate
 	  vacancies,	-- number of remaining vacancies
 	  final_result, -- "final" result flag
-	  round		-- which round this is
+	  round			-- which round this is
   ) as (select prefs[1],
 			   prefs[2:],
 			   count(*) over (partition by prefs[1]),
@@ -52,7 +121,7 @@ with recursive
 			   (select vacancies from cdata),
 			   false,
 			   1
-		  from ballots
+		  from cooked_ballots
 		 where prefs[1] is not null
 		union all
 		select c.candidate_id,
@@ -62,7 +131,7 @@ with recursive
 			   (select vacancies from cdata),
 			   false,
 			   1
-		  from candidates c
+		  from cur_candidates c
 		union all
 		-- recursive term starts here.
 		(with
@@ -106,7 +175,7 @@ with recursive
 						(cs.votes - cs.quota)/cs.votes as transfer_value,
 						cs.round
 				   from c_score cs
-				   join candidates c on (cs.candidate=c.candidate_id)
+				   join cur_candidates c on (cs.candidate=c.candidate_id)
 				  where cs.votes >= cs.quota
 				  order by cs.votes desc, cs.priority desc, c.precast_lots[round] desc
 				  limit 1),
@@ -121,7 +190,7 @@ with recursive
 						cs.quota,
 						cs.round
 				   from c_score cs
-				   join candidates c on (cs.candidate = c.candidate_id)
+				   join cur_candidates c on (cs.candidate = c.candidate_id)
 				  where not exists (select 1 from elect)
 				  order by cs.votes, cs.priority, c.precast_lots[round]
 				  limit 1),
@@ -152,8 +221,8 @@ with recursive
 		   -- for the candidate elected or excluded, we generate a new
 		   -- set of rows for their transferred ballots. The transfer
 		   -- value is determined by the elected/excluded candidate,
-		   -- but the priority must be updated to match the new first
-		   -- preference.
+		   -- but the priority must be updated (later) to match the
+		   -- new first preference.
 		   transfer
 			 as (select w.remainder[1] as candidate,
 						w.remainder[2:] as remainder,
@@ -214,6 +283,6 @@ select candidate,
 	   vote_value,
 	   round
   from work_ballots w
-  join candidates c on (w.candidate=c.candidate_id)
+  join cur_candidates c on (w.candidate=c.candidate_id)
  where final_result
  order by vote_value desc, round;
