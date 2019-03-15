@@ -173,10 +173,14 @@ with recursive
 		   -- to leave c_score empty (since we have no further use for
 		   -- it), which will force various intermediate tables below
 		   -- to also be empty.
+		   --
+		   -- Note that we have to exclude pending_xfer candidates
+		   -- from the count of the number of candidates remaining.
 		   c_score
 			 as (select *,
 			            s.votes - s.quota as surplus,
-			            (s.votes - s.quota)/s.votes as transfer_value
+			            (s.votes - s.quota)/nullif(s.votes,0)
+						  as transfer_value
 				   from (select w.candidate,
 								max(w.priority) as priority,
 								max(w.round) as round,
@@ -184,13 +188,17 @@ with recursive
 								(select quota from cdata) as quota,
 								max(w.vacancies) as vacancies,
 								bool_or(pending_xfer) as pending_xfer,
-								sum(every(not pending_xfer)::integer) over () as num_candidates
+								sum(every(not pending_xfer)::integer) over ()
+								  as num_candidates
 						   from w
 						  group by candidate) s
 				  where s.num_candidates > s.vacancies),
 		   -- first elect all the candidates over quota.
 		   elect
-			 as (select * from c_score where surplus >= 0 and not pending_xfer),
+			 as (select *
+			       from c_score
+				  where surplus >= 0
+				    and not pending_xfer),
 		   -- if nobody was elected this round, and there are no
 		   -- surpluses yet to transfer, we must exclude someone. the
 		   -- excluded candidate must have the lowest number of votes,
@@ -224,21 +232,27 @@ with recursive
 		     as (select s.candidate,
 			            s.transfer_value,
 						s.ranking = 1 as do_transfer
-				   from (select cs.candidate, cs.transfer_value,
-				   				row_number() over (order by cs.votes desc,
-						                                 	cs.priority desc,
-															c.precast_lots[round] desc)
+				   from (select cs.candidate,
+				                cs.transfer_value,
+				   				row_number()
+								  over (order by cs.votes desc,
+						                         cs.priority desc,
+												 c.precast_lots[round] desc)
 								  as ranking
 				           from c_score cs
-				           join cur_candidates c on (cs.candidate=c.candidate_id)
+				           join cur_candidates c
+						     on (cs.candidate=c.candidate_id)
 						  where cs.surplus > 0
 						 union all
 						 select e.candidate, 1, 1
 						   from exclude e) s),
-		   -- this is the candidate(s) we're retiring from the election in
-		   -- this round, whether by election or elimination or exhaustion.
-		   -- In the exhaustion case, this will be every remaining candidate
-		   -- (who are all treated as elected).
+		   -- this is the candidate(s) we're retiring from the
+		   -- election in this round, whether by election or
+		   -- elimination or exhaustion. In the exhaustion case, this
+		   -- will be every remaining candidate (who are all treated
+		   -- as elected). Note that pending_xfer candidates are not
+		   -- counted as "remaining" (since they were elected
+		   -- already).
 		   retire(
 			   candidate,
 			   quota,
@@ -262,7 +276,10 @@ with recursive
 		   -- set of rows for their transferred ballots. The transfer
 		   -- value is determined by the elected/excluded candidate,
 		   -- but the priority must be updated (later) to match the
-		   -- new first preference.
+		   -- new first preference. Since we might be retiring
+		   -- multiple candidates even though we transfer only one, we
+		   -- have to clean out the remainder list _before_ picking
+		   -- out the new first preference.
 		   transfer
 			 as (select s.remainder[1] as candidate,
 						s.remainder[2:] as remainder,
@@ -276,7 +293,8 @@ with recursive
 								w.vacancies,
 								w.round,
  			                    array(select c_id
-						                from unnest(w.remainder) with ordinality as u(c_id,ord)
+						                from unnest(w.remainder) with ordinality
+										       as u(c_id,ord)
 						               where c_id not in (select candidate from retire)
 							           order by ord)
 						          as remainder
@@ -294,7 +312,8 @@ with recursive
 		   keep
 			 as (select w.candidate,
 			            array(select c_id
-						        from unnest(w.remainder) with ordinality as u(c_id,ord)
+						        from unnest(w.remainder) with ordinality
+								       as u(c_id,ord)
 						       where c_id not in (select candidate from retire)
 							   order by ord)
 						  as remainder,
@@ -307,7 +326,7 @@ with recursive
 				  where s.do_transfer is not true
 				    and (s.do_transfer is false
 					     or w.candidate not in (select candidate from retire))),
-				  -- compile annotations
+		   -- compile annotations
 		   annotation(round,json)
 		     as (select r.round,
 			            to_jsonb(a)
@@ -336,7 +355,9 @@ with recursive
 						dense_rank() over (order by cs.votes, cs.priority)
 						  as priority,
 						s.vote_value,
-						s.vacancies - (select coalesce(sum(nelect)::integer,0) from retire) as vacancies,
+						s.vacancies
+						  - (select coalesce(sum(nelect)::integer,0) from retire)
+						  as vacancies,
 						s.round + 1 as round,
 						false as final_result,
 						s.pending_xfer,
