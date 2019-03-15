@@ -39,3 +39,18 @@ create table ballot_preferences
 	primary key (election_id, voter_id, candidate_id),
 	foreign key (election_id, candidate_id) references candidates
 );
+
+--
+-- Helper function to remove values from arrays
+--
+create function filter_out(anyarray, anyarray)
+  returns anyarray
+  language plpgsql immutable strict
+  as $f$
+    begin
+	  return array(select u.elt
+				     from unnest($1) with ordinality as u(elt,ord)
+                    where u.elt <> ALL ($2)
+					order by ord);
+	end;
+$f$;

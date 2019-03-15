@@ -162,59 +162,68 @@ with recursive
 		   w as (select * from work_ballots
 			 	  where not final_result
 					and vacancies > 0),
-		   -- compute current totals by candidate; also note priority
-		   -- and round for later use. Get the quota here as well for
-		   -- later computations to use.
-		   --
-		   -- However, if at this step the number of remaining
-		   -- candidates does not exceed the number of remaining
-		   -- vacancies, the election is over and everyone remaining
-		   -- is to be elected. The simplest way to deal with this is
-		   -- to leave c_score empty (since we have no further use for
-		   -- it), which will force various intermediate tables below
-		   -- to also be empty.
-		   --
-		   -- Note that we have to exclude pending_xfer candidates
-		   -- from the count of the number of candidates remaining.
-		   c_score
-			 as (select *,
+		   -- raw totals for candidates, including pending-xfer ones
+		   -- (who are already elected but still have ballots in the
+		   -- pool).
+		   raw_score
+		     as (select *,
 			            s.votes - s.quota as surplus,
 			            (s.votes - s.quota)/nullif(s.votes,0)
 						  as transfer_value
-				   from (select w.candidate,
+			 	   from (select w.candidate,
 								max(w.priority) as priority,
 								max(w.round) as round,
 								sum(w.vote_value) as votes,
 								(select quota from cdata) as quota,
 								max(w.vacancies) as vacancies,
-								bool_or(pending_xfer) as pending_xfer,
-								sum(every(not pending_xfer)::integer) over ()
-								  as num_candidates
-						   from w
-						  group by candidate) s
-				  where s.num_candidates > s.vacancies),
-		   -- first elect all the candidates over quota.
+								bool_or(pending_xfer) as pending_xfer
+				   		   from w
+				  		  group by candidate) s),
+		   -- Use the computed totals to determine possible fates for
+		   -- the candidate in this round. Not all the fates are final
+		   -- at this point, in particular "excludable" is only used
+		   -- if no candidate is elected or ballot transfer made.
+		   c_score
+			 as (select *,
+						s.votes >= s.quota
+						  as electable,
+						1 = rank() over (order by s.votes)
+						  as excludable,
+						s.vacancies >= count(*) over ()
+						  as exhaustable
+				   from raw_score s
+				  where not s.pending_xfer),
+		   -- first elect all the candidates over quota, or if we have
+		   -- enough vacancies to elect everyone left, do so.
 		   elect
 			 as (select *
 			       from c_score
-				  where surplus >= 0
-				    and not pending_xfer),
+				  where electable or exhaustable),
 		   -- if nobody was elected this round, and there are no
 		   -- surpluses yet to transfer, we must exclude someone. the
 		   -- excluded candidate must have the lowest number of votes,
 		   -- and in case of a tie, the lowest priority, and in case
 		   -- of a tie of that, the lowest precast lot for this round.
-		   -- Again, just return an empty result if the election is
-		   -- ending by exhaustion.
-		   exclude
+		   -- We do the selection in two steps so that we can document
+		   -- whether the priority or lot was used.
+		   excludable
 			 as (select cs.candidate,
 						cs.quota,
-						cs.round
+						cs.round,
+						rank() over (order by cs.votes,
+						                      cs.priority,
+											  c.precast_lots[cs.round])
+						  as rank,
+						c.precast_lots[round] as lot
 				   from c_score cs
 				   join cur_candidates c on (cs.candidate = c.candidate_id)
-				  where not exists (select 1 from c_score where surplus >= 0)
-				  order by cs.votes, cs.priority, c.precast_lots[round]
-				  limit 1),
+				  where cs.excludable
+				    and not exists (select 1 from raw_score where pending_xfer)
+				    and not exists (select 1 from elect)),
+		   exclude
+		     as (select *
+			       from excludable
+				  where rank = 1),
 		   -- we need to decide, if there are any surpluses or
 		   -- exclusions, whose votes will be transferred this round.
 		   -- We consider both candidates with pending transfers (who
@@ -231,28 +240,30 @@ with recursive
 		   surpluses
 		     as (select s.candidate,
 			            s.transfer_value,
-						s.ranking = 1 as do_transfer
-				   from (select cs.candidate,
-				                cs.transfer_value,
+						s.ranking = 1 as do_transfer,
+						s.priority,
+						s.lot
+				   from (select rs.candidate,
+				                rs.transfer_value,
 				   				row_number()
-								  over (order by cs.votes desc,
-						                         cs.priority desc,
+								  over (order by rs.votes desc,
+						                         rs.priority desc,
 												 c.precast_lots[round] desc)
-								  as ranking
-				           from c_score cs
+								  as ranking,
+								rs.priority,
+								c.precast_lots[round] as lot
+				           from raw_score rs
 				           join cur_candidates c
-						     on (cs.candidate=c.candidate_id)
-						  where cs.surplus > 0
+						     on (rs.candidate=c.candidate_id)
+						  where rs.surplus > 0
 						 union all
-						 select e.candidate, 1, 1
+						 select e.candidate, 1, 1, null, null
 						   from exclude e) s),
 		   -- this is the candidate(s) we're retiring from the
 		   -- election in this round, whether by election or
 		   -- elimination or exhaustion. In the exhaustion case, this
 		   -- will be every remaining candidate (who are all treated
-		   -- as elected). Note that pending_xfer candidates are not
-		   -- counted as "remaining" (since they were elected
-		   -- already).
+		   -- as elected).
 		   retire(
 			   candidate,
 			   quota,
@@ -262,16 +273,7 @@ with recursive
 				   from elect
 				 union all
 				 select candidate, 0, round, 0
-				   from exclude
-				 union all
-				 select w.candidate,
-						(select quota from cdata),
-						max(w.round),
-						1
-				   from w
-				  where not exists (select 1 from c_score)
-				  group by w.candidate
-				 having every(w.pending_xfer is false)),
+				   from exclude),
 		   -- for the candidate chosen for transfer, we generate a new
 		   -- set of rows for their transferred ballots. The transfer
 		   -- value is determined by the elected/excluded candidate,
@@ -280,7 +282,10 @@ with recursive
 		   -- multiple candidates even though we transfer only one, we
 		   -- have to clean out the remainder list _before_ picking
 		   -- out the new first preference.
-		   transfer
+		   --
+		   -- Do this in two steps to collect exhausted ballots for
+		   -- reporting purposes.
+		   raw_transfer
 			 as (select s.remainder[1] as candidate,
 						s.remainder[2:] as remainder,
 						trunc(s.vote_value * s.transfer_value,5)
@@ -292,30 +297,32 @@ with recursive
 				   				sp.transfer_value,
 								w.vacancies,
 								w.round,
- 			                    array(select c_id
-						                from unnest(w.remainder) with ordinality
-										       as u(c_id,ord)
-						               where c_id not in (select candidate from retire)
-							           order by ord)
+								filter_out(w.remainder,
+								           array(select candidate from retire))
 						          as remainder
 						   from w
 				   		   join surpluses sp on (sp.candidate=w.candidate)
-				  		  where sp.do_transfer) s
-				  where s.remainder[1] is not null),
+				  		  where sp.do_transfer) s),
+		   transfer
+		     as (select *
+			       from raw_transfer
+				  where candidate is not null),
 		   -- collect all existing ballots that will proceed to next
 		   -- round; we must remove the retiring candidates from the
 		   -- preference lists. Be sure to preserve order when
 		   -- removing candidates. The complication is that we keep
-		   -- ballots from retiring candidates if, and only if, they
-		   -- have surpluses that are not being transferred this
-		   -- round.
+		   -- ballots from retiring candidates, with their first
+		   -- preference unaltered, if, and only if, they have
+		   -- surpluses that are not being transferred this round.
+		   -- i.e.:
+		   --   candidate is not retiring - keep
+		   --   candidate is retiring with an untransferred surplus - keep
+		   --   candidate is retiring with no surplus or a transferred one
+		   --     -- discard
 		   keep
 			 as (select w.candidate,
-			            array(select c_id
-						        from unnest(w.remainder) with ordinality
-								       as u(c_id,ord)
-						       where c_id not in (select candidate from retire)
-							   order by ord)
+			            filter_out(w.remainder,
+						           array(select candidate from retire))
 						  as remainder,
 						w.vote_value,
 						w.vacancies,
@@ -323,9 +330,9 @@ with recursive
 						s.candidate is not null as pending_xfer
 				   from w
 				   left join surpluses s on (s.candidate=w.candidate)
-				  where s.do_transfer is not true
-				    and (s.do_transfer is false
-					     or w.candidate not in (select candidate from retire))),
+				   left join retire r on (r.candidate=w.candidate)
+				  where r.candidate is null
+				     or s.do_transfer is false),
 		   -- compile annotations
 		   annotation(round,json)
 		     as (select r.round,
@@ -333,17 +340,15 @@ with recursive
 			       from (select round from w limit 1) r,
 				        (select (select json_agg(c_score) from c_score) as c_score,
 								(select json_agg(s) from surpluses s) as surpluses,
-								(select json_agg(e) from exclude e) as exclude,
+								(select json_agg(e) from exclude e) as excludable,
 								(select json_agg(k) from (select candidate, vote_value, count(*)
 								 						    from keep
 														   group by candidate, vote_value) k)
 								  as keep,
 								(select json_agg(t) from (select candidate, vote_value, count(*)
-								                            from transfer
+								                            from raw_transfer
 														   group by candidate, vote_value) t)
-								  as transferred_ballots,
-								(select count(*) from keep) as n_keep,
-								(select count(*) from transfer) as n_xfer
+								  as transferred_ballots
 						) a),
 		   -- prepare the new ballot list for next time, and append
 		   -- the result row for the retiring candidates. Also output
